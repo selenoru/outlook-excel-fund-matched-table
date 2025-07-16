@@ -1,0 +1,139 @@
+import os
+import win32com.client
+from datetime import datetime, timedelta
+from openpyxl import load_workbook
+import xlwings as xw
+
+# --- CONFIG ---
+attachment_prefix = "123_ABC_"
+temp_save_folder = r"C:\Users\YourUsername\Desktop\temp" #A temporary location, nothing will be saved here
+output_excel = r"C:\Users\YourUsername\Desktop\Folder\your_excel_file.xlsx" #Change to the location of your excel file
+
+# --- FUNCTIONS ---
+def get_previous_business_day():
+    today = datetime.today()
+    one_day = timedelta(days=1)
+    previous = today - one_day
+    while previous.weekday() >= 5:
+        previous -= one_day
+    return previous.strftime("%Y%m%d")
+
+def get_next_business_day(date_obj):
+    next_day = date_obj + timedelta(days=1)
+    while next_day.weekday() >= 5:
+        next_day += timedelta(days=1)
+    return next_day
+
+# --- Step 1: Get the attachment from Outlook ---
+outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+mailbox = outlook.Folders.Item("myinbox@email.com")
+abc_folder = mailbox.Folders.Item("abc") #Change to your own email subfolder
+
+# Search Person 1 folder first
+print("Searching Person 1 folder...")
+person1_folder = abc_folder.Folders.Item("Person 1 SubFolder") #Assumes you have such a subfolder under "ABC"
+messages = person1_folder.Items
+messages.Sort("[ReceivedTime]", True)
+
+found_mail = None
+for msg in messages:
+    try:
+        if msg.SenderName.strip() == "Person 1 Full Name" and msg.Subject.strip() == "Full Email Subject":
+            found_mail = msg
+            print("Found email in Person 1 Folder")
+            break
+    except AttributeError:
+        continue
+
+# If not found, search Person 2 Folder // delete if you don't have/need a backup
+if not found_mail:
+    print("Trying Person 2 folder...")
+    person2_folder = abc_folder.Folders.Item("Person 2 Subfolder") #Assumes you have such a subfolder under "ABC"
+    messages = person2_folder.Items
+    messages.Sort("[ReceivedTime]", True)
+    for msg in messages:
+        try:
+            if msg.SenderName.strip() == "Person 2 Full Name" and msg.Subject.strip() == "Full Email Subject":
+                found_mail = msg
+                print("Found email in Person 2 folder.")
+                break
+        except AttributeError:
+            continue
+
+    if not found_mail:
+        print("No matching email found in either folder.")
+        exit()
+
+# --- Step 2: Save the Excel attachment ---
+date_suffix = get_previous_business_day()
+expected_prefix = f"{attachment_prefix}{date_suffix}"
+saved_file_path = None
+
+for attachment in found_mail.Attachments:
+    if attachment.FileName.startswith(expected_prefix):
+        os.makedirs(temp_save_folder, exist_ok=True)
+        saved_file_path = os.path.join(temp_save_folder, attachment.FileName)
+        attachment.SaveAsFile(saved_file_path)
+        print(f"Saved attachment: {saved_file_path}")
+        break
+
+if not saved_file_path:
+    print(f"Attachment starting with {expected_prefix} not found.")
+    exit()
+
+# --- Step 3: Extract value from A1 using xlwings ---
+usd_value = None
+try:
+    app = xw.App(visible=False)
+    wb_xls = app.books.open(saved_file_path)
+    ws = wb_xls.sheets[0]
+    usd_value = ws.range("A1").value #Change A1 to your desired field
+    print(f"Extracted USD value: {usd_value}")
+    wb_xls.close()
+    app.quit()
+except Exception as e:
+    print(f"Failed to extract value: {e}")
+    app.quit()
+    exit()
+
+# Delete temp file
+try:
+    os.remove(saved_file_path)
+    print("Temporary file deleted.")
+except Exception as e:
+    print(f"Could not delete temp file: {e}")
+
+# --- Step 4: Insert into output Excel ---
+wb_final = load_workbook(output_excel)
+ws_final = wb_final.active
+last_row = ws_final.max_row
+while last_row > 0 and ws_final[f"A{last_row}"].value is None:
+    last_row -= 1
+
+last_date_val = ws_final[f"A{last_row}"].value
+if isinstance(last_date_val, str):
+    last_date_obj = datetime.strptime(last_date_val, "%d.%m.%Y")
+else:
+    last_date_obj = last_date_val
+
+next_date = get_next_business_day(last_date_obj)
+next_row = last_row + 1
+ws_final[f"A{next_row}"] = next_date
+ws_final[f"A{next_row}"].number_format = "DD.MM.YYYY"
+ws_final[f"B{next_row}"] = usd_value
+
+wb_final.save(output_excel)
+print(f"Updated Excel: {next_date.strftime('%d.%m.%Y')} | USD: {usd_value}")
+
+# --- Step 5: Email the updated file ---
+outlook = win32com.client.Dispatch("Outlook.Application")
+mail = outlook.CreateItem(0)
+mail.SentOnBehalfOfName = "senderemail@email.com" #delete this line if you want to send from your default email
+mail.To = "recipient@email.com"
+mail.CC = "ccrecipient@email.com"
+mail.Subject = "Desired Subject Line"
+mail.Body = "Hello,\n\nAttached is the file with the current business day and the extracted USD value.\n\nRegards,"
+mail.Attachments.Add(output_excel)
+mail.Display()
+
+print("Email ready to send!")
